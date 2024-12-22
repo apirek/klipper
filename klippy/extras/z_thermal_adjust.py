@@ -30,6 +30,8 @@ class ZThermalAdjuster:
         # Register printer events
         self.printer.register_event_handler("klippy:connect",
                                             self.handle_connect)
+        self.printer.register_event_handler("homing:home_rails_begin",
+                                            self.handle_homing_move_begin)
         self.printer.register_event_handler("homing:home_rails_end",
                                             self.handle_homing_move_end)
 
@@ -57,6 +59,7 @@ class ZThermalAdjuster:
         self.adjust_enable = True
         self.last_position = [0., 0., 0., 0.]
         self.next_transform = None
+        self.homing = False
 
         # Register gcode commands
         self.gcode.register_command('SET_Z_THERMAL_ADJUST',
@@ -87,12 +90,16 @@ class ZThermalAdjuster:
             'enabled': self.adjust_enable
         }
 
+    def handle_homing_move_begin(self, homing_state, rails):
+        self.homing = True
+
     def handle_homing_move_end(self, homing_state, rails):
         'Set reference temperature after Z homing.'
         if 2 in homing_state.get_axes():
             self.ref_temperature = self.smoothed_temp
             self.ref_temp_override = False
             self.z_adjust_mm = 0.
+            self.homing = False
 
     def calc_adjust(self, pos):
         'Z adjustment calculation'
@@ -129,13 +136,19 @@ class ZThermalAdjuster:
         return [pos[0], pos[1], unadjusted_z, pos[3]]
 
     def get_position(self):
-        position = self.calc_unadjust(self.next_transform.get_position())
-        self.last_position = self.calc_adjust(position)
+        if self.homing:
+            position = self.next_transform.get_position()
+            self.last_position[:] = position
+        else:
+            position = self.calc_unadjust(self.next_transform.get_position())
+            self.last_position = self.calc_adjust(position)
         return position
 
     def move(self, newpos, speed):
+        if self.homing:
+            self.next_transform.move(newpos, speed)
         # don't apply to extrude only moves or when disabled
-        if (newpos[0:2] == self.last_position[0:2]) or not self.adjust_enable:
+        elif (newpos[0:2] == self.last_position[0:2]) or not self.adjust_enable:
             z = newpos[2] + self.last_z_adjust_mm
             adjusted_pos = [newpos[0], newpos[1], z, newpos[3]]
             self.next_transform.move(adjusted_pos, speed)
