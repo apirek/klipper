@@ -7,6 +7,7 @@
 # Adjusts Z position in real-time using a thermal probe to e.g. compensate
 # for thermal expansion of the printer frame.
 
+import math
 import threading
 
 KELVIN_TO_CELSIUS = -273.15
@@ -21,6 +22,8 @@ class ZThermalAdjuster:
         # Get config parameters, convert to SI units where necessary
         self.temp_coeff = config.getfloat('temp_coeff', minval=-1, maxval=1,
             default=0)
+        self.axis_length = config.getfloat('axis_length', default=0)
+        self.axis_zero = config.getfloat('axis_zero', default=0)
         self.off_above_z = config.getfloat('z_adjust_off_above', 99999999.)
         self.max_z_adjust_mm = config.getfloat('max_z_adjustment', 99999999.)
 
@@ -108,13 +111,21 @@ class ZThermalAdjuster:
                     adjust], key=abs)
 
         # Apply Z adjustment
-        new_z = pos[2] + self.z_adjust_mm
+        adjust = self.z_adjust_mm
+        if self.axis_length > 0:
+            x = (self.axis_zero + pos[0]) / self.axis_length
+            adjust *= math.sin(x * math.pi)
+        new_z = pos[2] + adjust
         self.last_z_adjust_mm = self.z_adjust_mm
         return [pos[0], pos[1], new_z, pos[3]]
 
     def calc_unadjust(self, pos):
         'Remove Z adjustment'
-        unadjusted_z = pos[2] - self.z_adjust_mm
+        adjust = self.z_adjust_mm
+        if self.axis_length > 0:
+            x = (self.axis_zero + pos[0]) / self.axis_length
+            adjust *= math.sin(x * math.pi)
+        unadjusted_z = pos[2] - adjust
         return [pos[0], pos[1], unadjusted_z, pos[3]]
 
     def get_position(self):
