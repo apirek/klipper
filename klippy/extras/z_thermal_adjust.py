@@ -9,6 +9,7 @@
 
 import math
 import threading
+from .bed_mesh import MoveSplitter
 
 KELVIN_TO_CELSIUS = -273.15
 
@@ -55,11 +56,12 @@ class ZThermalAdjuster:
 
         # Z transformation
         self.z_adjust_mm = 0.
-        self.last_z_adjust_mm = 0.
         self.adjust_enable = True
         self.last_position = [0., 0., 0., 0.]
         self.next_transform = None
         self.homing = False
+        self.splitter = MoveSplitter(config, self.gcode)
+        self.splitter.initialize(self, 0.)
 
         # Register gcode commands
         self.gcode.register_command('SET_Z_THERMAL_ADJUST',
@@ -101,47 +103,41 @@ class ZThermalAdjuster:
             self.z_adjust_mm = 0.
             self.homing = False
 
-    def calc_adjust(self, pos):
+    def calc_adjust_raw(self):
         'Z adjustment calculation'
-        if pos[2] < self.off_above_z:
-            delta_t = self.smoothed_temp - self.ref_temperature
+        delta_t = self.smoothed_temp - self.ref_temperature
+        # Calculate Z adjustment
+        adjust = -1 * self.temp_coeff * delta_t
+        # compute sign (+1 or -1) for maximum offset setting
+        sign = 1 - (adjust <= 0)*2
+        adjust = min(self.max_z_adjust_mm*sign, adjust, key=abs)
+        return adjust
 
-            # Calculate Z adjustment
-            adjust = -1 * self.temp_coeff * delta_t
-
-            # compute sign (+1 or -1) for maximum offset setting
-            sign = 1 - (adjust <= 0)*2
-
-            # Don't apply adjustments smaller than step distance
-            if abs(adjust - self.z_adjust_mm) > self.z_step_dist:
-                self.z_adjust_mm = min([self.max_z_adjust_mm*sign,
-                    adjust], key=abs)
-
-        # Apply Z adjustment
-        adjust = self.z_adjust_mm
+    def calc_adjust(self, x, y, adjust):
         if self.axis_length > 0:
-            x = (self.axis_zero + pos[0]) / self.axis_length
+            x = (self.axis_zero + x) / self.axis_length
             adjust *= math.sin(x * math.pi)
-        new_z = pos[2] + adjust
-        self.last_z_adjust_mm = self.z_adjust_mm
-        return [pos[0], pos[1], new_z, pos[3]]
+        return adjust
 
-    def calc_unadjust(self, pos):
-        'Remove Z adjustment'
-        adjust = self.z_adjust_mm
-        if self.axis_length > 0:
-            x = (self.axis_zero + pos[0]) / self.axis_length
-            adjust *= math.sin(x * math.pi)
-        unadjusted_z = pos[2] - adjust
-        return [pos[0], pos[1], unadjusted_z, pos[3]]
+    # Called by MoveSplitter
+    def calc_z(self, x, y):
+        # Save the current raw adjustment to remove it from the toolhead position
+        # when someone asks for it.
+        self.z_adjust_mm = self.calc_adjust_raw()
+        adjust = self.calc_adjust(x, y, self.z_adjust_mm)
+        return adjust
 
     def get_position(self):
+        position = self.next_transform.get_position()
         if self.homing:
-            position = self.next_transform.get_position()
             self.last_position[:] = position
         else:
-            position = self.calc_unadjust(self.next_transform.get_position())
-            self.last_position = self.calc_adjust(position)
+            # Remove adjustment from return value.
+            # Original implementation does not calculate adjustment but uses last value.
+            position[2] -= self.calc_adjust(position[0], position[1], self.z_adjust_mm)
+            # Don't apply adjustment to saved position like the original implementation
+            # did, it would be applied twice.
+            self.last_position[:] = position
         return position
 
     def move(self, newpos, speed):
@@ -149,12 +145,19 @@ class ZThermalAdjuster:
             self.next_transform.move(newpos, speed)
         # don't apply to extrude only moves or when disabled
         elif (newpos[0:2] == self.last_position[0:2]) or not self.adjust_enable:
-            z = newpos[2] + self.last_z_adjust_mm
+            z = newpos[2] + self.calc_adjust(newpos[0], newpos[1], self.z_adjust_mm)
             adjusted_pos = [newpos[0], newpos[1], z, newpos[3]]
             self.next_transform.move(adjusted_pos, speed)
         else:
-            adjusted_pos = self.calc_adjust(newpos)
-            self.next_transform.move(adjusted_pos, speed)
+            factor = 1. if newpos[2] < self.off_above_z else 0.
+            self.splitter.build_move(self.last_position, newpos, factor)
+            while not self.splitter.traverse_complete:
+                split_move = self.splitter.split()
+                if split_move:
+                    self.next_transform.move(split_move, speed)
+                else:
+                    raise self.gcode.error(
+                        "Z Thermal Adjust: Error splitting move ")
         self.last_position[:] = newpos
 
     def temperature_callback(self, read_time, temp):
